@@ -5,6 +5,9 @@ else
 	HIDEDAEMONS=()
 fi
 
+_systemctl="/usr/bin/systemctl" # some people seem to not have /usr/bin in $PATH when using sudo
+_journalctl="/usr/bin/journalctl"
+
 s.start()       { s_systemctl "start"   $1; }
 s.stop()        { s_systemctl "stop"    $1; }
 s.restart()     { s_systemctl "restart" $1; }
@@ -12,10 +15,10 @@ s.reload()      { s_systemctl "reload"  $1; }
 s.enable()      { s_systemctl "enable"  $1; }
 s.disable()     { s_systemctl "disable" $1; }
 s.status()      { s_systemctl "status"  $1; }
-s.listfailed()  { systemctl --failed; }
+s.listfailed()  { $_systemctl --failed; }
 s.analyze()     { systemd-analyze $*; }
-s.wants()       { systemctl show -p "Wants" $1; }
-s.logsize()     { s_exec "journalctl --disk-usage"; }
+s.wants()       { $_systemctl show -p "Wants" $1; }
+s.logsize()     { s_exec "${_journalctl}"" --disk-usage"; }
 s.list()        { s_list_services "list"; }
 s.log()         { s_journalctl "$@"; }
 s.tree()        { s_exec "systemd-cgls --all"; }
@@ -77,6 +80,7 @@ s_systemctl() {
 	unitName="$(s_get_unit_name $2)"
 	daemon="$unitName.$unitType"
 	if [[ $(s_daemon_exists $daemon $unitType) == 1 ]]; then echo -e "\e[1;31m:: \e[1;37m $daemon daemon does not exist\e[0m"; return; fi
+	s_exec "/bin/true" # if sudo then ask for password now to avoid messing up the output later
 	case $1 in
 		start|stop|restart|reload)
 			systemctl -q is-active "${daemon}" >& /dev/null
@@ -92,12 +96,12 @@ s_systemctl() {
 			if [[ "$1" == "stop" ]];    then echo -en "\e[1;34m:: \e[1;37m Stopping $daemon daemon\e[0m"; cols=25; fi
 			if [[ "$1" == "restart" ]]; then echo -en "\e[1;34m:: \e[1;37m Restarting $daemon daemon\e[0m"; cols=27; fi
 			if [[ "$1" == "reload" ]];  then echo -en "\e[1;34m:: \e[1;37m Reloading $daemon daemon\e[0m"; cols=26; fi
-			s_exec "systemctl -q ${1} ${daemon}"
+			s_exec "${_systemctl} -q ${1} ${daemon}"
 			if [[ $? -eq 0 ]]; then s_msg $daemon $cols 7 "DONE"; else s_msg $daemon $cols 1 "FAIL"; s_systemctl "status" $daemon; fi
 			;;
 		enable|disable)
 			if [[ ! "${daemon}" =~ @ ]]; then # sadly is-enabled does not work as expected for "@" services like dhcpcd@eth0
-				if systemctl -q is-enabled "${daemon}" >& /dev/null; then
+				if ${_systemctl} -q is-enabled "${daemon}" >& /dev/null; then
 					if [[ "$1" == "enable" ]]; then echo -e "\e[1;31m:: \e[1;37m $daemon daemon is already enabled\e[0m"; return; fi
 				else
 					if [[ "$1" == "disable" ]]; then echo -e "\e[1;31m:: \e[1;37m $daemon daemon is not enabled\e[0m"; return; fi
@@ -106,11 +110,11 @@ s_systemctl() {
 			f=${1:0:1}
 			echo -en "\e[1;34m:: \e[1;37m ""${f^^}""${1:1:${#1}-2}""ing $daemon daemon\e[0m"
 			if [[ "$1" == "enable" ]]; then cols=25; else cols=26; fi
-			s_exec "systemctl -q ${1} ${daemon}"
+			s_exec "${_systemctl} -q ${1} ${daemon}"
 			if [[ $? -eq 0 ]]; then s_msg $daemon $cols 7 "DONE"; else s_msg $daemon $cols 1 "FAIL"; fi
 			;;
 		status)	
-			systemctl status ${daemon}
+			${_systemctl} status ${daemon}
 			;;
 	esac
 }
@@ -121,13 +125,13 @@ s_journalctl() {
 	daemon="$unitName.$unitType"
 	if [[ $(s_daemon_exists "${daemon}" $unitType) == 0 ]]; then
 		options=""; for ((i=1; i<$#; ++i )) ; do options="${options}""${!i}"" "; done
-		s_exec "journalctl --all $options _SYSTEMD_UNIT=${daemon}";
+		s_exec "${_journalctl} --all $options _SYSTEMD_UNIT=${daemon}";
 	else
-		s_exec "journalctl --all $*";
+		s_exec "${_journalctl} --all $*";
 	fi
 }
 
-s_list_services () { systemctl --no-legend -t service list-unit-files | grep -v static  \
+s_list_services () { $_systemctl --no-legend -t service list-unit-files | grep -v static  \
 	|	{ 
 			while read -r service daemonstate ; do
 				
@@ -138,7 +142,7 @@ s_list_services () { systemctl --no-legend -t service list-unit-files | grep -v 
 				daemon="${service}"
 				if [[ "${daemon:${#daemon}-1}" == "@" ]]; then
 					if s_hidedaemon ${daemon}; then continue; fi;
-					daemons=$(systemctl --no-legend -t service | grep -o "${daemon}[A-Za-z0-9_/=:-]*")
+					daemons=$(${_systemctl} --no-legend -t service | grep -o "${daemon}[A-Za-z0-9_/=:-]*")
 					if [[ "${daemons[0]}" == "" ]]; then daemons=($daemon); fi # when no instance of "@" service is started it appears just as dhcpcd@
 				else
 					daemons=($daemon)
@@ -152,7 +156,7 @@ s_list_services () { systemctl --no-legend -t service list-unit-files | grep -v 
 						if [[ "${1}" == "${daemonstate}" ]]; then printf "%s\n" "${daemon}"; fi
 						continue
 					fi
-					systemctl -q is-active "${daemon}" >& /dev/null
+					${_systemctl} -q is-active "${daemon}" >& /dev/null
 					if [[ $? -eq 0 ]]; then
 							if [[ "${1}" == "list" ]]; then
 								echo -en "\e[1;37mSTARTED"
@@ -187,7 +191,7 @@ s_list_services () { systemctl --no-legend -t service list-unit-files | grep -v 
 s_daemon_exists() {
 	unitType="$(s_get_unit_type $1 ${2:-service})"
 	baseName="$(s_get_basic_unit_name $1)"
-	if systemctl --no-legend -t "$unitType" list-unit-files | grep -v static | (grep -Eq "^$baseName(@.*)?\.$unitType" >& /dev/null); then echo 0; else echo 1; fi
+	if ${_systemctl} --no-legend -t "$unitType" list-unit-files | grep -v static | (grep -Eq "^$baseName(@.*)?\.$unitType" >& /dev/null); then echo 0; else echo 1; fi
 }
 
 s_msg() {
@@ -205,7 +209,7 @@ s_hidedaemon() {
 # $1: optional type
 s_bashcompletion_list_by_type () { 
 	unitType=$(get_unity_type "$1" service)
-	systemctl --no-legend -t $unitType list-unit-files  \
+	${_systemctl} --no-legend -t $unitType list-unit-files  \
 		|	{ while read -r a b  ; do printf "%s\n" "${a}"; done; }
 }
 
